@@ -1,0 +1,124 @@
+h1. 🚀 [EPIC] MQ2DB Engine Core Design and Architecture
+
+h2. 1. 🎯 Context and Existing System (As-Is)
+Historically, the system relies on a monolithic component that listens to an *MQ Series* queue. As they are read, messages are written to *temporary physical files* (buffer files) on the server's disk to form batches.
+This operation has architectural limitations:
+* Strong dependency on local disk (difficult to implement Active-Active clustering).
+* Performance issues related to disk I/O.
+* Complex error recovery in case of a server crash during a temporary file write.
+
+----
+
+h2. 2. 🌟 The New Paradigm (To-Be)
+The new solution aims to completely eliminate these physical buffer files by using the *Relational Database as a buffer zone (source)*. Batches are no longer built on disk, but logically within the database.
+
+For separation of concerns, the new architecture is split into two distinct components:
+
+# *The MQ Feeder (Out of scope for this Epic):*
+#* Exclusively responsible for listening to the MQ Series queue.
+#* It inserts raw messages directly into the database (generic {{CB_MSG}} table and the corresponding business table).
+# *The MQ2DB Engine (The Kernel - Scope of this Epic):*
+#* The heart of the system. It polls the database, retrieves asynchronous messages, and manages the grouping logic (batching).
+#* *The "Logical File" concept:* Instead of creating a temporary physical file, the Engine creates a row in the {{CB_FILE}} table representing the batch. All messages ({{CB_MSG}}) validated for this batch are updated with this file's ID (Many-to-One relationship).
+#* Once the logical file is closed, it publishes a notification to inform downstream systems.
+
+----
+
+h2. 3. 🚧 Technical Issues and Challenges of the Engine
+This new batching engine ({{MQ2DB Engine}}) must meet strict Enterprise-class constraints:
+* *Order Preservation (Strict FIFO):* Messages must imperatively be processed and inserted into logical files respecting exactly their chronological arrival order in the database (original MQ Series order).
+* *High Availability (Active-Active):* The Engine must run on several servers simultaneously for load balancing.
+* *Concurrency Control (Zero Duplicates):* If two nodes read the database, they must never include the same message in two different batches.
+* *Fault Tolerance:* If a server crashes in the middle of building a batch, the aggregation state must not be lost and no message should remain stuck.
+* *High Performance:* Absorption of extreme load peaks (e.g., 100,000 messages) without congesting the Oracle database.
+
+----
+
+h2. 4. 💡 Solution Architecture (MQ2DB Engine)
+To meet these challenges, the MQ2DB Kernel relies on the *Spring Integration* framework backed by a database cluster (JDBC Message Store). It is broken down into 4 major subsystems:
+
+# *The Poller (Vacuum & Lock):* It polls messages in the database with {{NEW}} status. It uses the advanced Oracle clause {{FOR UPDATE SKIP LOCKED}} to lock a batch of messages without blocking other instances. It marks messages with a _Claim Token_ (UUID) and changes their status to {{IN_PROGRESS}}.
+# *The Aggregator (The Sorting Station):* Driven by Spring Integration, it receives messages and sorts them into shared clustered "buckets" (by Stream and by Branch). It waits for the threshold to be reached (e.g., 500 msgs) or for a Timeout to expire (e.g., 2 min) to release the batch.
+# *The Batch Processor (The Logical Generator & Order Guarantor):* It receives the released batch. *It performs a strict chronological sort (FIFO)* of the messages in memory, inserts a row in {{CB_FILE}} (the logical file), associates this row with all {{CB_MSG}} in the batch (N..1 relationship), sets the status to {{DONE}}, and triggers a notification via Oracle AQ.
+# *The Reapers (Self-Healing):* Background processes (watchdogs) that monitor anomalies. If messages remain stuck in {{IN_PROGRESS}} for too long (e.g., hardware crash of an instance), the Reaper "cleans up" these orphans and resets them to {{NEW}} to be picked up by the healthy cluster.
+
+----
+
+h2. 5. 🗺️ Architecture Diagrams
+
+{panel:title=Note for diagrams|borderStyle=solid|borderColor=#ccc|bgColor=#f2f2f2}
+Generate the Mermaid diagrams below via https://mermaid.live and attach the images to this Epic.
+{panel}
+
+h3. A. Global View: From MQ to Logical File
+
+{code:javascript}
+graph TD
+    classDef external fill:#f9f2f4,stroke:#333,stroke-width:2px;
+    classDef feeder fill:#fff3cd,stroke:#856404,stroke-width:2px;
+    classDef engine fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    classDef db fill:#e2e3e5,stroke:#383d41,stroke-width:2px;
+
+    MQ((MQ Series Queue)) class MQ external;
+
+    subgraph "Part 1 (Out of Scope)"
+        Feed[Feeder Component] class Feed feeder;
+    end
+
+    subgraph "Oracle Database (Source & Logic)"
+        CBMSG[Table CB_MSG<br/>Unitary messages] class CBMSG db;
+        CBFILE[Table CB_FILE<br/>Logical Files] class CBFILE db;
+        STORE[Tables EF_INT_MESSAGE<br/>Aggregation state] class STORE db;
+    end
+
+    subgraph "Part 2: MQ2DB Engine (Scope)"
+        Node1[Instance 1] class Node1 engine;
+        Node2[Instance 2] class Node2 engine;
+    end
+
+    AQ[[Oracle AQ<br/>Notifications]] class AQ external;
+
+    MQ -->|Consumes| Feed
+    Feed -->|Insert| CBMSG
+
+    CBMSG -->|Poll (SKIP LOCKED)| Node1
+    CBMSG -->|Poll (SKIP LOCKED)| Node2
+
+    Node1 <-->|Aggregation Coordination| STORE
+    Node2 <-->|Aggregation Coordination| STORE
+
+    Node1 -->|1. FIFO Sort & Logical Batch Creation| CBFILE
+    Node2 -->|1. FIFO Sort & Logical Batch Creation| CBFILE
+
+    CBMSG -.->|Many-To-One Relation<br/>Status update DONE| CBFILE
+
+    Node1 -->|2. Notifies| AQ
+    Node2 -->|2. Notifies| AQ
+{code}
+
+h3. B. Message Lifecycle (Workflow)
+
+{code:javascript}
+stateDiagram-v2
+    direction LR
+
+    state "NEW" as new
+    state "IN_PROGRESS" as inprog
+    state "DONE" as done
+
+    [*] --> new : Inserted by Feeder (MQ Order)
+
+    new --> inprog : 1. POLLER (Picked up by a node)\n[Claim Token added]
+
+    state inprog {
+        [*] --> Splitter : Unitary processing
+        Splitter --> Aggregator : Stored in DB (EF_INT_MESSAGE)
+        Aggregator --> [*] : Threshold of 500 reached\nor 2min Timeout
+    }
+
+    inprog --> done : 2. PROCESSOR (Generation)\n[Strict FIFO sort + CB_FILE creation]
+
+    inprog --> new : 3. REAPER (Safety)\n[If Node crash > 30 min]
+
+    done --> [*] : AQ Notification sent
+{code}

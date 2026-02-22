@@ -1,0 +1,124 @@
+h1. 🚀 [EPIC] Conception et Architecture du socle MQ2DB Engine
+
+h2. 1. 🎯 Contexte et Existant (As-Is)
+Historiquement, le système s'appuie sur un composant monolithique qui écoute une file d'attente *MQ Series*. Au fil de l'eau, les messages lus sont écrits dans des *fichiers physiques temporaires* (fichiers tampons) sur le disque du serveur afin de constituer des lots.
+Ce fonctionnement présente des limites architecturales :
+* Adhérence forte au disque local (difficile de faire du clustering Actif-Actif).
+* Problèmes de performance liés aux I/O disque.
+* Reprise sur erreur complexe en cas de crash serveur pendant l'écriture d'un fichier temporaire.
+
+----
+
+h2. 2. 🌟 Le Nouveau Paradigme (To-Be)
+La nouvelle solution vise à supprimer totalement ces fichiers tampons physiques en utilisant la *Base de Données relationnelle comme zone tampon (souche)*. Les lots ne sont plus construits sur le disque, mais de manière logique en base de données.
+
+Pour des raisons de séparation des responsabilités, la nouvelle architecture est scindée en deux composants distincts :
+
+# *Le MQ Feeder (Hors scope de cette Epic) :*
+#* Responsable exclusif de l'écoute de la queue MQ Series.
+#* Il insère les messages bruts directement dans la base de données (table générique {{CB_MSG}} et table métier correspondante).
+# *Le MQ2DB Engine (Le Kernel - Périmètre de cette Epic) :*
+#* Le cœur du réacteur. Il scrute la base de données, récupère les messages asynchrones et gère la logique de regroupement (lotissement).
+#* *Le concept de "Fichier Logique" :* Au lieu de créer un fichier physique temporaire, l'Engine crée une ligne dans la table {{CB_FILE}} qui représente le lot. Tous les messages ({{CB_MSG}}) validés pour ce lot sont mis à jour avec l'ID de ce fichier (Relation _Many-to-One_).
+#* Une fois le fichier logique clos, il publie une notification pour prévenir les systèmes avals.
+
+----
+
+h2. 3. 🚧 Problématiques et Défis Techniques de l'Engine
+Ce nouveau moteur de lotissement ({{MQ2DB Engine}}) doit répondre à des contraintes de classe Entreprise très strictes :
+* *Préservation de l'Ordre (FIFO stricte) :* Les messages doivent impérativement être traités et insérés dans les fichiers logiques en respectant exactement leur ordre d'arrivée chronologique dans la base de données (ordre d'origine du MQ Series).
+* *Haute Disponibilité (Actif-Actif) :* L'Engine doit tourner sur plusieurs serveurs simultanément pour la répartition de charge.
+* *Concurrence d'accès (Zéro doublon) :* Si deux nœuds lisent la base, ils ne doivent jamais embarquer le même message dans deux lots différents.
+* *Tolérance aux pannes :* Si un serveur crashe au milieu de la constitution d'un lot, l'état d'agrégation ne doit pas être perdu et aucun message ne doit rester bloqué.
+* *Haute Performance :* Absorption de pics de charge extrêmes (ex: 100 000 messages) sans congestionner la base Oracle.
+
+----
+
+h2. 4. 💡 Architecture de la Solution (MQ2DB Engine)
+Pour relever ces défis, le Kernel MQ2DB s'appuie sur le framework *Spring Integration* adossé à un cluster de base de données (JDBC Message Store). Il se décompose en 4 grands sous-systèmes :
+
+# *Le Poller (Aspirateur & Verrou) :* Il scrute les messages en base au statut {{NEW}}. Il utilise la clause Oracle avancée {{FOR UPDATE SKIP LOCKED}} pour verrouiller un lot de messages sans bloquer les autres instances. Il marque les messages avec un _Claim Token_ (UUID) et passe leur statut à {{IN_PROGRESS}}.
+# *L'Agrégateur (La Gare de Triage) :* Piloté par Spring Integration, il reçoit les messages et les trie dans des "seaux" partagés en cluster (par Flux et par Branche). Il attend que le seuil soit atteint (ex: 500 msgs) ou qu'un Timeout expire (ex: 2 min) pour libérer le lot.
+# *Le Batch Processor (Le Générateur Logique & Garant de l'Ordre) :* Il réceptionne le lot libéré. *Il effectue un tri chronologique strict (FIFO)* des messages en mémoire, insère une ligne dans {{CB_FILE}} (le fichier logique), associe cette ligne à tous les {{CB_MSG}} du lot (relation N..1), passe le statut à {{DONE}}, et déclenche une notification via Oracle AQ.
+# *Les Reapers (L'Auto-Guérison) :* Des processus de fond (watchdogs) qui surveillent les anomalies. Si des messages restent bloqués {{IN_PROGRESS}} trop longtemps (ex: crash matériel d'une instance), le Reaper "nettoie" ces orphelins et les remet à {{NEW}} pour être repris par le cluster sain.
+
+----
+
+h2. 5. 🗺️ Diagrammes d'Architecture
+
+{panel:title=Note pour les diagrammes|borderStyle=solid|borderColor=#ccc|bgColor=#f2f2f2}
+Générez les diagrammes Mermaid ci-dessous via https://mermaid.live et attachez les images à cette Epic.
+{panel}
+
+h3. A. Vue Globale : Du MQ au Fichier Logique
+
+{code:javascript}
+graph TD
+    classDef external fill:#f9f2f4,stroke:#333,stroke-width:2px;
+    classDef feeder fill:#fff3cd,stroke:#856404,stroke-width:2px;
+    classDef engine fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    classDef db fill:#e2e3e5,stroke:#383d41,stroke-width:2px;
+
+    MQ((Queue MQ Series)) class MQ external;
+
+    subgraph "Partie 1 (Hors Scope)"
+        Feed[Composant Feeder] class Feed feeder;
+    end
+
+    subgraph "Base de Données Oracle (Souche & Logique)"
+        CBMSG[Table CB_MSG<br/>Messages unitaires] class CBMSG db;
+        CBFILE[Table CB_FILE<br/>Fichiers Logiques] class CBFILE db;
+        STORE[Tables EF_INT_MESSAGE<br/>État d'agrégation] class STORE db;
+    end
+
+    subgraph "Partie 2 : MQ2DB Engine (Périmètre)"
+        Node1[Instance 1] class Node1 engine;
+        Node2[Instance 2] class Node2 engine;
+    end
+
+    AQ[[Oracle AQ<br/>Notifications]] class AQ external;
+
+    MQ -->|Consomme| Feed
+    Feed -->|Insert| CBMSG
+
+    CBMSG -->|Poll (SKIP LOCKED)| Node1
+    CBMSG -->|Poll (SKIP LOCKED)| Node2
+
+    Node1 <-->|Coordination de l'agrégation| STORE
+    Node2 <-->|Coordination de l'agrégation| STORE
+
+    Node1 -->|1. Tri FIFO & Création Lot Logique| CBFILE
+    Node2 -->|1. Tri FIFO & Création Lot Logique| CBFILE
+
+    CBMSG -.->|Relation Many-To-One<br/>Mise à jour statut DONE| CBFILE
+
+    Node1 -->|2. Notifie| AQ
+    Node2 -->|2. Notifie| AQ
+{code}
+
+h3. B. Cycle de Vie d'un Message (Workflow)
+
+{code:javascript}
+stateDiagram-v2
+    direction LR
+
+    state "NEW" as new
+    state "IN_PROGRESS" as inprog
+    state "DONE" as done
+
+    [*] --> new : Inséré par le Feeder (Ordre MQ)
+
+    new --> inprog : 1. POLLER (Aspiration par un nœud)\n[Ajout du Claim Token]
+
+    state inprog {
+        [*] --> Splitter : Traitement unitaire
+        Splitter --> Aggregator : Stocké en base (EF_INT_MESSAGE)
+        Aggregator --> [*] : Seuil de 500 atteint\nou Timeout 2min
+    }
+
+    inprog --> done : 2. PROCESSOR (Génération)\n[Tri strict FIFO + Création CB_FILE]
+
+    inprog --> new : 3. REAPER (Sécurité)\n[Si Nœud crash > 30 min]
+
+    done --> [*] : Notification AQ envoyée
+{code}
